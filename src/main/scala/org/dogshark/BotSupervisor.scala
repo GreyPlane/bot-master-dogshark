@@ -3,7 +3,7 @@ package org.dogshark
 
 import akka.Done
 import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
+import akka.actor.typed._
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.StatusCodes
 import akka.http.scaladsl.model.ws.{Message, TextMessage, WebSocketRequest}
@@ -23,33 +23,37 @@ object BotSupervisor {
 
   type BotCommand = AnyEvent :+: AnyActionResponse :+: BotProtocol :+: CNil
 
-  def apply(botPairs: List[(String, Behavior[BotCommand])], botConfig: Config): Behavior[SupervisorCommand] = {
-    Behaviors.setup { implicit context =>
-      implicit val system: ActorSystem[Nothing] = context.system
-      implicit val ec: ExecutionContextExecutor = context.executionContext
-      if (botPairs.map(_._1).toSet.size != botPairs.size) throw new IllegalArgumentException("bot id must be unique")
-      val botRefs = botPairs.map {
-        case (id, behavior) => (id, context.spawn(behavior, id))
-      }.toMap
-      val socket = botConfig.getString("socket")
-      val ((actionQueue, apiSocketUpgrade), apiSocketClose) = setupApiStream(socket, botRefs)
-      context.pipeToSelf(apiSocketUpgrade) { tryUpgrade =>
-        tryUpgrade.map(upgrade => if (upgrade.response.status == StatusCodes.SwitchingProtocols) ConnectionSuccess(actionQueue) else ConnectionFailed).getOrElse(ConnectionFailed)
-      }
-      val (eventSocketUpgrade, eventSocketClose) = setupEventStream(socket, botRefs)
-      Behaviors
-        .receiveMessage[SupervisorCommand] {
-          case ConnectionSuccess(queue) =>
-            botRefs.foreach { case (_, ref) => ref ! Coproduct[BotCommand](ApiSocketConnected(queue)) }
-            Behaviors.same;
-          case Terminate =>
-            actionQueue.complete()
-            import cats.implicits._
-            Await.result(List(apiSocketClose, eventSocketClose).sequence, 10.seconds)
-            Behaviors.stopped
+  def apply(botPairs: List[(String, Behavior[BotCommand])], botConfig: Config): Behavior[SupervisorCommand] =
+    Behaviors.supervise[SupervisorCommand] {
+      Behaviors.setup { implicit context =>
+        implicit val system: ActorSystem[Nothing] = context.system
+        implicit val ec: ExecutionContextExecutor = context.executionContext
+        if (botPairs.map(_._1).toSet.size != botPairs.size) throw new IllegalArgumentException("bot id must be unique")
+        val botRefs = botPairs.map {
+          case (id, behavior) =>
+            val botRef = context.spawn(behavior, id)
+            context.watch(botRef)
+            (id, botRef)
+        }.toMap
+        val socket = botConfig.getString("socket")
+        val ((actionQueue, apiSocketUpgrade), apiSocketClose) = setupApiStream(socket, botRefs)
+        context.pipeToSelf(apiSocketUpgrade) { tryUpgrade =>
+          tryUpgrade.map(upgrade => if (upgrade.response.status == StatusCodes.SwitchingProtocols) ConnectionSuccess(actionQueue) else ConnectionFailed).getOrElse(ConnectionFailed)
         }
-    }
-  }
+        val (eventSocketUpgrade, eventSocketClose) = setupEventStream(socket, botRefs)
+        Behaviors
+          .receiveMessage[SupervisorCommand] {
+            case ConnectionSuccess(queue) =>
+              botRefs.foreach { case (_, ref) => ref ! Coproduct[BotCommand](ApiSocketConnected(queue)) }
+              Behaviors.same;
+            case Terminate =>
+              actionQueue.complete()
+              import cats.implicits._
+              Await.result(List(apiSocketClose, eventSocketClose).sequence, 10.seconds)
+              Behaviors.stopped
+          }
+      }
+    }.onFailure[DeathPactException](SupervisorStrategy.restart)
 
   private def setupApiStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
                             (implicit system: ActorSystem[Nothing], ec: ExecutionContext) = {
