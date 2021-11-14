@@ -16,7 +16,7 @@ import org.dogshark.OneBotProtocol._
 import shapeless._
 
 import scala.concurrent.duration.DurationInt
-import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutor, Future}
+import scala.concurrent.{Await, ExecutionContextExecutor, Future}
 
 
 object BotSupervisor {
@@ -51,17 +51,21 @@ object BotSupervisor {
               import cats.implicits._
               Await.result(List(apiSocketClose, eventSocketClose).sequence, 10.seconds)
               Behaviors.stopped
+            case _ => Behaviors.ignore
           }
       }
     }.onFailure[DeathPactException](SupervisorStrategy.restart)
 
   private def setupApiStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
-                            (implicit system: ActorSystem[Nothing], ec: ExecutionContext) = {
-    val replyToBot: Sink[AnyActionResponse, Future[Done]] = Sink.foreach {
-      case res@AnyActionResponse(_, maybeBotId, _, _) => for {
-        botId <- maybeBotId
+                            (implicit system: ActorSystem[Nothing]) = {
+    val replyToBot: Sink[Message, Future[Done]] = Sink.foreach {
+      case message: TextMessage.Strict => for {
+        json <- parse(message.getStrictText).toOption
+        res <- json.as[AnyActionResponse].toOption
+        botId <- res.echo
         actorRef <- botRefs.get(botId)
       } yield actorRef ! Coproduct[BotCommand](res)
+      case _ => system.log.warn("unknown message from api socket")
     }
 
     val apiSocket = Http().webSocketClientFlow(WebSocketRequest(s"$socket/api"))
@@ -69,16 +73,13 @@ object BotSupervisor {
     Source.queue[AnyAction](100)
       .map(action => TextMessage(action.asJson.noSpaces))
       .viaMat(apiSocket)(Keep.both)
-      .mapAsync(4) {
-        case t: TextMessage => t.toStrict(10.seconds).map(tt => parse(tt.getStrictText).flatMap(_.as[AnyActionResponse]).getOrElse(throw new IllegalArgumentException("")))
-      }
       .toMat(replyToBot)(Keep.both)
       .withAttributes(ActorAttributes.supervisionStrategy { e: Throwable => system.log.error("Exception in stream", e); Supervision.Stop })
       .run()
   }
 
   private def setupEventStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
-                              (implicit system: ActorSystem[Nothing], ec: ExecutionContext) = {
+                              (implicit system: ActorSystem[Nothing]) = {
 
     val broadcastToBot: Sink[Message, Future[Done]] = Sink.foreach {
       case message: TextMessage.Strict => {
