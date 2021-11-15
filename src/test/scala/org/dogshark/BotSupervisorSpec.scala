@@ -1,6 +1,6 @@
 package org.dogshark
 
-import akka.actor.testkit.typed.scaladsl.{ActorTestKit, ScalaTestWithActorTestKit}
+import akka.actor.testkit.typed.scaladsl.ScalaTestWithActorTestKit
 import com.typesafe.config.{Config, ConfigFactory}
 import org.dogshark.BotSupervisor.Terminate
 import org.scalatest.wordspec.AnyWordSpecLike

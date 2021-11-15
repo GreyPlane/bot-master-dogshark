@@ -1,47 +1,61 @@
 package org.dogshark
 
 import akka.actor.typed.Behavior
-import akka.actor.typed.scaladsl.Behaviors
+import akka.actor.typed.scaladsl.{Behaviors, StashBuffer}
 import akka.stream.BoundedSourceQueue
 import io.circe.syntax._
-import org.dogshark.BotSupervisor.{ApiSocketConnected, BotCommand, BotProtocol}
+import org.dogshark.BotSupervisor.{ApiSocketConnected, BotProtocol}
 import org.dogshark.OneBotProtocol.actionParams._
 import org.dogshark.OneBotProtocol.{AnyAction, AnyActionResponse, AnyEvent}
-import shapeless._
+import org.slf4j
 
 object DumbDumb {
 
   val BOT_ID: String = "dumbdumb"
 
-  private object echo extends Poly1 {
-    implicit def caseAnyActionResponse = at[AnyActionResponse](actionResponse => {
-      println(actionResponse.data.noSpaces)
-      Behaviors.same[BotCommand]
-    })
-
-    implicit def caseAnyEvent(implicit apiChannel: BoundedSourceQueue[AnyAction]) = at[AnyEvent] {
-      case AnyEvent(eventType, body) => {
-        println(body.noSpaces)
-        if (eventType == "message") {
-          for {
-             message <- body.hcursor.get[String]("raw_message")
-             user <- body.hcursor.get[Int]("user_id")
-             _ <- Right(apiChannel.offer(AnyAction("send_msg", Some(SendMessage("private", Some(user), None, s"bark!!! -> $message").asJson))))
-          } yield ()
-        }
-        Behaviors.same[BotCommand]
+  def apply(): Behavior[BotProtocol] =
+    Behaviors.setup[BotProtocol] { implicit context =>
+      Behaviors.withStash(100) { implicit buffer =>
+        implicit val log: slf4j.Logger = context.log
+        waitingForApiConnection
       }
     }
 
-    implicit def caseDefault[T] = at[T] { _ => Behaviors.ignore[BotCommand] }
-  }
-  private val waitingForApiConnection: Behavior[BotCommand] = Behaviors
-    .receiveMessage(_.select[BotProtocol].map { case ApiSocketConnected(queue) => withApiChannel(queue) }.getOrElse(Behaviors.ignore))
+  private def waitingForApiConnection(implicit log: slf4j.Logger, buffer: StashBuffer[BotProtocol]): Behavior[BotProtocol] =
+    Behaviors
+      .receiveMessage[BotProtocol] {
+        case m: Bark =>
+          buffer.stash(m)
+          Behaviors.same
+        case ApiSocketConnected(queue) => buffer.unstashAll(withApiChannel(queue))
+        case _ => Behaviors.ignore
+      }
 
-  def apply(): Behavior[BotCommand] = waitingForApiConnection
+  private def withApiChannel(channel: BoundedSourceQueue[AnyAction])(implicit log: slf4j.Logger): Behavior[BotProtocol] =
+    Behaviors
+      .receiveMessage[BotProtocol] {
+        case AnyActionResponse(data, echo, code, status) => {
+          log.info(data.noSpaces)
+          Behaviors.same
+        }
+        case AnyEvent(eventType, body) => {
+          log.info(body.noSpaces)
+          if (eventType == "message") {
+            for {
+              message <- body.hcursor.get[String]("raw_message")
+              user <- body.hcursor.get[Int]("user_id")
+              _ <- Right(channel.offer(AnyAction("send_msg", Some(SendMessage("private", Some(user), None, s"bark!!! -> $message").asJson))))
+            } yield ()
+          }
+          Behaviors.same
+        }
+        case Bark(to) =>
+          channel.offer(AnyAction("send_msg", Some(SendMessage("private", Some(to), None, "bark from dumbdumb!").asJson)))
+          Behaviors.same
+        case _ => Behaviors.ignore
+      }
 
-  private def withApiChannel(implicit channel: BoundedSourceQueue[AnyAction]): Behavior[BotCommand] = Behaviors
-    .receiveMessage(_.fold(echo))
+  final case class Bark(to: Int) extends BotProtocol
 
 
 }

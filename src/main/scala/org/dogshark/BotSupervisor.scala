@@ -2,8 +2,8 @@ package org.dogshark
 
 
 import akka.Done
-import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed._
+import akka.actor.typed.scaladsl.Behaviors
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.StatusCodes
 import akka.http.scaladsl.model.ws.{Message, TextMessage, WebSocketRequest}
@@ -13,7 +13,6 @@ import com.typesafe.config.Config
 import io.circe.parser._
 import io.circe.syntax._
 import org.dogshark.OneBotProtocol._
-import shapeless._
 
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.{Await, ExecutionContextExecutor, Future}
@@ -21,9 +20,7 @@ import scala.concurrent.{Await, ExecutionContextExecutor, Future}
 
 object BotSupervisor {
 
-  type BotCommand = AnyEvent :+: AnyActionResponse :+: BotProtocol :+: CNil
-
-  def apply(botPairs: List[(String, Behavior[BotCommand])], botConfig: Config): Behavior[SupervisorCommand] =
+  def apply(botPairs: List[(String, Behavior[BotProtocol])], botConfig: Config): Behavior[SupervisorCommand] =
     Behaviors.supervise[SupervisorCommand] {
       Behaviors.setup { implicit context =>
         implicit val system: ActorSystem[Nothing] = context.system
@@ -44,7 +41,7 @@ object BotSupervisor {
         Behaviors
           .receiveMessage[SupervisorCommand] {
             case ConnectionSuccess(queue) =>
-              botRefs.foreach { case (_, ref) => ref ! Coproduct[BotCommand](ApiSocketConnected(queue)) }
+              botRefs.foreach { case (_, ref) => ref ! ApiSocketConnected(queue) }
               Behaviors.same;
             case Terminate =>
               actionQueue.complete()
@@ -56,7 +53,7 @@ object BotSupervisor {
       }
     }.onFailure[DeathPactException](SupervisorStrategy.restart)
 
-  private def setupApiStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
+  private def setupApiStream(socket: String, botRefs: Map[String, ActorRef[BotProtocol]])
                             (implicit system: ActorSystem[Nothing]) = {
     val replyToBot: Sink[Message, Future[Done]] = Sink.foreach {
       case message: TextMessage.Strict => for {
@@ -64,7 +61,7 @@ object BotSupervisor {
         res <- json.as[AnyActionResponse].toOption
         botId <- res.echo
         actorRef <- botRefs.get(botId)
-      } yield actorRef ! Coproduct[BotCommand](res)
+      } yield actorRef ! res
       case _ => system.log.warn("unknown message from api socket")
     }
 
@@ -78,7 +75,7 @@ object BotSupervisor {
       .run()
   }
 
-  private def setupEventStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
+  private def setupEventStream(socket: String, botRefs: Map[String, ActorRef[BotProtocol]])
                               (implicit system: ActorSystem[Nothing]) = {
 
     val broadcastToBot: Sink[Message, Future[Done]] = Sink.foreach {
@@ -87,7 +84,7 @@ object BotSupervisor {
         val eventType = json.hcursor.get[String]("post_type").getOrElse("unknown")
         if (eventType != "meta_event") {
           botRefs.values.foreach {
-            _ ! Coproduct[BotCommand](AnyEvent(eventType, json))
+            _ ! AnyEvent(eventType, json)
           }
         } else {
           system.log.debug(s"receive meta event:\n${json.noSpaces}")
@@ -99,7 +96,8 @@ object BotSupervisor {
     Http().singleWebSocketRequest(WebSocketRequest(s"$socket/event"), Flow.fromSinkAndSourceMat(broadcastToBot, Source.maybe)(Keep.left))
   }
 
-  sealed trait BotProtocol
+  // break the ADT property, but has no other way
+  trait BotProtocol
 
   sealed trait SupervisorCommand
 
