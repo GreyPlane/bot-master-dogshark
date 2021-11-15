@@ -14,6 +14,8 @@ import io.circe.parser._
 import io.circe.syntax._
 import org.dogshark.OneBotProtocol._
 import shapeless._
+import shapeless.ops.coproduct
+import shapeless.ops.hlist
 
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.{Await, ExecutionContextExecutor, Future}
@@ -23,13 +25,15 @@ object BotSupervisor {
 
   type BotCommand = AnyEvent :+: AnyActionResponse :+: BotProtocol :+: CNil
 
-  def apply(botPairs: List[(String, Behavior[BotCommand])], botConfig: Config): Behavior[SupervisorCommand] =
+  def apply[T <: Coproduct, L <: HList](botPairs: L, botConfig: Config)
+                           (implicit ev$1: coproduct.Inject[T, BotCommand], ev$2: hlist.ToTraversable.Aux[L, List, (String, Behavior[T])]): Behavior[SupervisorCommand] =
     Behaviors.supervise[SupervisorCommand] {
       Behaviors.setup { implicit context =>
         implicit val system: ActorSystem[Nothing] = context.system
         implicit val ec: ExecutionContextExecutor = context.executionContext
-        if (botPairs.map(_._1).toSet.size != botPairs.size) throw new IllegalArgumentException("bot id must be unique")
-        val botRefs = botPairs.map {
+        val botList = botPairs.toList
+        if (botList.map(_._1).toSet.size != botList.size) throw new IllegalArgumentException("bot id must be unique")
+        val botRefs = botList.map {
           case (id, behavior) =>
             val botRef = context.spawn(behavior, id)
             context.watch(botRef)
@@ -44,27 +48,28 @@ object BotSupervisor {
         Behaviors
           .receiveMessage[SupervisorCommand] {
             case ConnectionSuccess(queue) =>
-              botRefs.foreach { case (_, ref) => ref ! Coproduct[BotCommand](ApiSocketConnected(queue)) }
+              botRefs.foreach { case (_, ref) => ref ! Coproduct[T](Coproduct[BotCommand](ApiSocketConnected(queue))) }
               Behaviors.same;
             case Terminate =>
               actionQueue.complete()
               import cats.implicits._
               Await.result(List(apiSocketClose, eventSocketClose).sequence, 10.seconds)
               Behaviors.stopped
+            case ConnectionFailed => Behaviors.stopped
             case _ => Behaviors.ignore
           }
       }
     }.onFailure[DeathPactException](SupervisorStrategy.restart)
 
-  private def setupApiStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
-                            (implicit system: ActorSystem[Nothing]) = {
+  private def setupApiStream[T <: Coproduct](socket: String, botRefs: Map[String, ActorRef[T]])
+                            (implicit system: ActorSystem[Nothing], ev$1: coproduct.Inject[T, BotCommand]) = {
     val replyToBot: Sink[Message, Future[Done]] = Sink.foreach {
       case message: TextMessage.Strict => for {
         json <- parse(message.getStrictText).toOption
         res <- json.as[AnyActionResponse].toOption
         botId <- res.echo
         actorRef <- botRefs.get(botId)
-      } yield actorRef ! Coproduct[BotCommand](res)
+      } yield actorRef ! Coproduct[T](Coproduct[BotCommand](res))
       case _ => system.log.warn("unknown message from api socket")
     }
 
@@ -78,8 +83,8 @@ object BotSupervisor {
       .run()
   }
 
-  private def setupEventStream(socket: String, botRefs: Map[String, ActorRef[BotCommand]])
-                              (implicit system: ActorSystem[Nothing]) = {
+  private def setupEventStream[T <: Coproduct](socket: String, botRefs: Map[String, ActorRef[T]])
+                              (implicit system: ActorSystem[Nothing], ev$1: coproduct.Inject[T, BotCommand]) = {
 
     val broadcastToBot: Sink[Message, Future[Done]] = Sink.foreach {
       case message: TextMessage.Strict => {
@@ -87,7 +92,7 @@ object BotSupervisor {
         val eventType = json.hcursor.get[String]("post_type").getOrElse("unknown")
         if (eventType != "meta_event") {
           botRefs.values.foreach {
-            _ ! Coproduct[BotCommand](AnyEvent(eventType, json))
+            _ ! Coproduct[T](Coproduct[BotCommand](AnyEvent(eventType, json)))
           }
         } else {
           system.log.debug(s"receive meta event:\n${json.noSpaces}")
