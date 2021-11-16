@@ -37,12 +37,15 @@ object BotSupervisor {
         context.pipeToSelf(apiSocketUpgrade) { tryUpgrade =>
           tryUpgrade.map(upgrade => if (upgrade.response.status == StatusCodes.SwitchingProtocols) ConnectionSuccess(actionQueue) else ConnectionFailed).getOrElse(ConnectionFailed)
         }
-        val (eventSocketUpgrade, eventSocketClose) = setupEventStream(socket, botRefs)
+        val (_, eventSocketClose) = setupEventStream(socket, botRefs)
         Behaviors
           .receiveMessage[SupervisorCommand] {
             case ConnectionSuccess(queue) =>
               botRefs.foreach { case (_, ref) => ref ! ApiSocketConnected(queue) }
               Behaviors.same;
+            case Forward(botId, message) =>
+              botRefs.get(botId).foreach(_ ! message)
+              Behaviors.same
             case Terminate =>
               actionQueue.complete()
               import cats.implicits._
@@ -106,6 +109,8 @@ object BotSupervisor {
   private case class ConnectionSuccess(queue: BoundedSourceQueue[AnyAction]) extends SupervisorCommand
 
   case object Terminate extends SupervisorCommand
+
+  case class Forward(botId: String, message: BotProtocol) extends SupervisorCommand
 
   private case object ConnectionFailed extends SupervisorCommand
 }
